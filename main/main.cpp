@@ -1,4 +1,4 @@
-// ESP32 Time Server v2
+// ESP32 Time Server v2.1
 // Copyright Rob Latour, 2026
 
 //
@@ -14,7 +14,7 @@
 //
 // GPS (recommended):   SparkFun GNSS Receiver Breakout - MAX-M10S  https://www.sparkfun.com/sparkfun-gnss-receiver-breakout-max-m10s-qwiic.html
 //
-// LCD2004:             blue/green screen with HD44780 I2C serial interface adapter https://www.aliexpress.com/item/1005006829045609.html?spm=a2g0o.order_list.order_list_main.11.29521802ixry0y
+// LCD2004:             blue/green screen with HD44780 I2C serial interface adapter https://www.aliexpress.com/item/1005006829045609.html.
 //
 // Wiring:
 //
@@ -35,6 +35,7 @@
 // one terminal       <- -> ESP32-P4-ETH GPI03
 // the other terminal <- -> ESP32-P4-ETH GND
 
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -59,6 +60,7 @@ extern "C"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "hd44780.h"
@@ -96,9 +98,10 @@ static bool s_lcd_line_cached[lcdRows] = {};
 static EventGroupHandle_t s_net_event_group = nullptr;
 static SemaphoreHandle_t s_time_mutex = nullptr;
 static SemaphoreHandle_t s_pps_semaphore = nullptr;
-static SemaphoreHandle_t s_pps_discipline_semaphore = nullptr;
+static QueueHandle_t s_pps_timestamp_queue = nullptr;
 static SemaphoreHandle_t s_ota_mutex = nullptr;
 static SemaphoreHandle_t s_lcd_mutex = nullptr;
+static SemaphoreHandle_t s_sync_state_mutex = nullptr;
 
 static bool s_ota_in_progress = false;
 static bool s_ota_failed = false;
@@ -108,9 +111,9 @@ static int64_t s_ota_failure_display_until_us = 0;
 static int64_t s_ota_reboot_at_us = 0;
 static char s_ota_error_reason[lcdColumns + 1] = "";
 
-static volatile bool s_safe_guard_tripped = false;
-static volatile bool s_time_setting_in_progress = false;
-static volatile bool s_time_has_been_set = false;
+static std::atomic<bool> s_safe_guard_tripped{false};
+static std::atomic<bool> s_time_setting_in_progress{false};
+static std::atomic<bool> s_time_has_been_set{false};
 static uint64_t s_ntp_reference_time_64 = 0;
 static bool s_ntp_reference_valid = false;
 
@@ -125,7 +128,45 @@ static bool s_gps_required_assume_success = false;
 // rather the program sets it to true if it is required (due to an older / ubox uncompliant hardware gps module being used)
 
 static bool s_use_nmea_fallback = false;
-static volatile bool s_pps_discipline_active = false;
+static std::atomic<bool> s_pps_discipline_active{false};
+
+enum class sync_fault_t : uint8_t
+{
+    none = 0,
+    pps_missing,
+    gps_invalid,
+    sanity_mismatch,
+    sync_stale
+};
+
+struct sync_state_t
+{
+    int64_t last_successful_sync_us = 0;
+    int64_t last_sync_attempt_us = 0;
+    int64_t last_pps_seen_us = 0;
+    time_t last_sync_delta_seconds = 0;
+    uint32_t consecutive_sync_failures = 0;
+    uint32_t consecutive_sanity_failures = 0;
+    bool holdover_mode = false;
+    bool pps_active = false;
+    sync_fault_t fault = sync_fault_t::none;
+};
+
+struct sync_candidate_t
+{
+    time_t candidate_time = 0;
+    bool use_pps_alignment = false;
+    bool used_nmea_fallback = false;
+    int64_t pps_release_time_us = 0;
+    sync_fault_t failure = sync_fault_t::none;
+};
+
+static sync_state_t s_sync_state{};
+static constexpr int64_t Sync_Stale_After_Us = static_cast<int64_t>(periodicGPSRefreshEveryThisNumberOfMinutes) * 60LL * 1000000LL * 3LL;
+static constexpr int64_t Sync_Reboot_After_Us = 30LL * 60LL * 1000000LL;
+static constexpr int64_t Max_Sync_Attempt_Us = 10000000LL;
+static constexpr uint32_t Sync_Failures_Before_Runtime_Recovery = 3;
+static constexpr uint32_t Sanity_Failures_Before_Fault = 2;
 
 static constexpr char GPS_NVS_NAMESPACE[] = "gps_state";
 static constexpr char GPS_NVS_KEY_ID_TYPE[] = "id_type";
@@ -167,6 +208,168 @@ struct nmea_rmc_time_t
     int minute = 0;
     int second = 0;
 };
+
+static void refresh_sync_state_locked(sync_state_t *state, int64_t now_us)
+{
+    if (state == nullptr)
+        return;
+
+    bool sync_stale = state->last_successful_sync_us > 0 && (now_us - state->last_successful_sync_us) > Sync_Stale_After_Us;
+    bool discipline_lost = s_time_has_been_set.load() && !state->pps_active;
+
+    if (sync_stale)
+    {
+        state->fault = sync_fault_t::sync_stale;
+    }
+    else if (discipline_lost)
+    {
+        if (state->fault == sync_fault_t::none || state->fault == sync_fault_t::pps_missing || state->fault == sync_fault_t::sync_stale)
+            state->fault = sync_fault_t::pps_missing;
+    }
+    else if (state->fault == sync_fault_t::pps_missing || state->fault == sync_fault_t::sync_stale)
+    {
+        state->fault = sync_fault_t::none;
+    }
+
+    state->holdover_mode = sync_stale || discipline_lost || state->fault != sync_fault_t::none;
+}
+
+static void sync_state_note_attempt()
+{
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.last_sync_attempt_us = esp_timer_get_time();
+        refresh_sync_state_locked(&s_sync_state, s_sync_state.last_sync_attempt_us);
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+}
+
+static void sync_state_note_pps_edge(int64_t edge_us)
+{
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.last_pps_seen_us = edge_us;
+        s_sync_state.pps_active = true;
+        refresh_sync_state_locked(&s_sync_state, edge_us);
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+}
+
+static void sync_state_note_pps_timeout(int64_t now_us)
+{
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.pps_active = false;
+        refresh_sync_state_locked(&s_sync_state, now_us);
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+}
+
+static uint32_t sync_state_note_failure(sync_fault_t fault, time_t update_delta)
+{
+    uint32_t failure_count = 0;
+
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.last_sync_delta_seconds = update_delta;
+        s_sync_state.consecutive_sync_failures++;
+        s_sync_state.fault = fault;
+        refresh_sync_state_locked(&s_sync_state, esp_timer_get_time());
+        failure_count = s_sync_state.consecutive_sync_failures;
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+
+    return failure_count;
+}
+
+static uint32_t sync_state_note_sanity_retry(time_t update_delta)
+{
+    uint32_t failure_count = 0;
+
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.last_sync_delta_seconds = update_delta;
+        s_sync_state.consecutive_sync_failures++;
+        s_sync_state.consecutive_sanity_failures++;
+        refresh_sync_state_locked(&s_sync_state, esp_timer_get_time());
+        failure_count = s_sync_state.consecutive_sanity_failures;
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+
+    return failure_count;
+}
+
+static void sync_state_clear_sanity_failures()
+{
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.consecutive_sanity_failures = 0;
+        refresh_sync_state_locked(&s_sync_state, esp_timer_get_time());
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+}
+
+static void sync_state_reset_failure_counters()
+{
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.consecutive_sync_failures = 0;
+        s_sync_state.consecutive_sanity_failures = 0;
+        refresh_sync_state_locked(&s_sync_state, esp_timer_get_time());
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+}
+
+static void sync_state_note_success(time_t update_delta)
+{
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        s_sync_state.last_successful_sync_us = esp_timer_get_time();
+        s_sync_state.last_sync_delta_seconds = update_delta;
+        s_sync_state.consecutive_sync_failures = 0;
+        s_sync_state.consecutive_sanity_failures = 0;
+        s_sync_state.fault = sync_fault_t::none;
+        refresh_sync_state_locked(&s_sync_state, s_sync_state.last_successful_sync_us);
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+}
+
+static sync_state_t get_sync_state_snapshot()
+{
+    sync_state_t snapshot{};
+
+    if (xSemaphoreTake(s_sync_state_mutex, portMAX_DELAY) == pdTRUE)
+    {
+        refresh_sync_state_locked(&s_sync_state, esp_timer_get_time());
+        snapshot = s_sync_state;
+        xSemaphoreGive(s_sync_state_mutex);
+    }
+
+    return snapshot;
+}
+
+static const char *sync_fault_to_display_text(sync_fault_t fault)
+{
+    switch (fault)
+    {
+    case sync_fault_t::pps_missing:
+        return "Holdover: PPS miss";
+    case sync_fault_t::gps_invalid:
+        return "Holdover: GPS inval";
+    case sync_fault_t::sanity_mismatch:
+        return "Holdover: sanity";
+    case sync_fault_t::sync_stale:
+        return "Holdover: sync old";
+    default:
+        return "";
+    }
+}
+
+static bool first_sync_candidates_are_plausible(const sync_candidate_t &first_candidate, const sync_candidate_t &second_candidate)
+{
+    time_t delta = second_candidate.candidate_time - first_candidate.candidate_time;
+    return delta >= 1 && delta <= 3;
+}
 
 static esp_err_t lcd_write_i2c(const hd44780_t *lcd, uint8_t data)
 {
@@ -1170,11 +1373,12 @@ static void halt_with_display(const char *line1, const char *line2, const char *
 
 static void IRAM_ATTR pps_isr_handler(void *arg)
 {
+    int64_t edge_us = esp_timer_get_time();
     BaseType_t higher_priority_task_woken = pdFALSE;
     if (s_pps_semaphore != nullptr)
         xSemaphoreGiveFromISR(s_pps_semaphore, &higher_priority_task_woken);
-    if (s_pps_discipline_semaphore != nullptr)
-        xSemaphoreGiveFromISR(s_pps_discipline_semaphore, &higher_priority_task_woken);
+    if (s_pps_timestamp_queue != nullptr)
+        xQueueOverwriteFromISR(s_pps_timestamp_queue, &edge_us, &higher_priority_task_woken);
     if (higher_priority_task_woken == pdTRUE)
         portYIELD_FROM_ISR();
 }
@@ -1214,10 +1418,12 @@ static void pps_discipline_task(void *parameter)
 
     for (;;)
     {
-        if (xSemaphoreTake(s_pps_discipline_semaphore, pdMS_TO_TICKS(1000)) == pdTRUE)
+        int64_t edge_us = 0;
+        if (xQueueReceive(s_pps_timestamp_queue, &edge_us, pdMS_TO_TICKS(1000)) == pdTRUE)
         {
-            last_pps_us = esp_timer_get_time();
-            s_pps_discipline_active = true;
+            last_pps_us = edge_us;
+            s_pps_discipline_active.store(true);
+            sync_state_note_pps_edge(edge_us);
 
             if (!logged_active)
             {
@@ -1226,18 +1432,27 @@ static void pps_discipline_task(void *parameter)
                 logged_active = true;
             }
 
-            if (!s_time_has_been_set || s_time_setting_in_progress)
+            if (!s_time_has_been_set.load() || s_time_setting_in_progress.load())
                 continue;
 
             if (xSemaphoreTake(s_time_mutex, pdMS_TO_TICKS(20)) != pdTRUE)
                 continue;
 
+            int64_t processing_now_us = esp_timer_get_time();
             struct timeval now{};
             gettimeofday(&now, nullptr);
 
-            int64_t phase_error_us = static_cast<int64_t>(now.tv_usec);
+            int64_t current_time_us = static_cast<int64_t>(now.tv_sec) * 1000000LL + static_cast<int64_t>(now.tv_usec);
+            int64_t wake_delay_us = processing_now_us - edge_us;
+            if (wake_delay_us < 0)
+                wake_delay_us = 0;
+            int64_t edge_time_us = current_time_us - wake_delay_us;
+
+            int64_t phase_error_us = edge_time_us % 1000000LL;
             if (phase_error_us > 500000)
                 phase_error_us -= 1000000;
+            else if (phase_error_us < -500000)
+                phase_error_us += 1000000;
 
             int64_t correction_us = -phase_error_us;
             if (llabs(correction_us) >= minCorrectionMagnitudeUs && llabs(phase_error_us) <= maxPhaseErrorUsToCorrect)
@@ -1268,7 +1483,8 @@ static void pps_discipline_task(void *parameter)
                 if (logged_active && debugIsOn)
                     ESP_LOGW(TAG, "PPS discipline inactive (PPS signal unavailable).");
                 logged_active = false;
-                s_pps_discipline_active = false;
+                s_pps_discipline_active.store(false);
+                sync_state_note_pps_timeout(now_us);
             }
         }
 
@@ -1680,8 +1896,9 @@ void create_mutexes_and_semaphores(void)
     s_lcd_mutex = xSemaphoreCreateMutex();
     s_time_mutex = xSemaphoreCreateMutex();
     s_pps_semaphore = xSemaphoreCreateBinary();
-    s_pps_discipline_semaphore = xSemaphoreCreateBinary();
+    s_pps_timestamp_queue = xQueueCreate(1, sizeof(int64_t));
     s_ota_mutex = xSemaphoreCreateMutex();
+    s_sync_state_mutex = xSemaphoreCreateMutex();
 }
 
 void initialize_the_display(void)
@@ -2052,6 +2269,151 @@ void setup_for_ota_updates()
     xTaskCreatePinnedToCore(ota_service_task, "ota_service", 3560, nullptr, 5, nullptr, 0);
 }
 
+static bool acquire_sync_candidate(sync_candidate_t *candidate)
+{
+    if (candidate == nullptr)
+        return false;
+
+    *candidate = sync_candidate_t{};
+    candidate->used_nmea_fallback = s_use_nmea_fallback;
+    candidate->pps_release_time_us = esp_timer_get_time();
+    int64_t attempt_start_us = candidate->pps_release_time_us;
+
+    if (s_use_nmea_fallback)
+    {
+        nmea_rmc_time_t nmea_time{};
+        if (!wait_for_nmea_rmc_time(&nmea_time, 3000UL))
+        {
+            candidate->failure = sync_fault_t::gps_invalid;
+            return false;
+        }
+
+        candidate->candidate_time = epoch_from_utc(nmea_time.year, nmea_time.month, nmea_time.day, nmea_time.hour, nmea_time.minute, nmea_time.second);
+
+        clear_pps_events();
+        if (xSemaphoreTake(s_pps_semaphore, pdMS_TO_TICKS(1500)) == pdTRUE)
+        {
+            candidate->use_pps_alignment = true;
+            candidate->pps_release_time_us = esp_timer_get_time();
+            candidate->candidate_time += 1;
+        }
+        else
+        {
+            if (debugIsOn)
+                ESP_LOGE(TAG, "NMEA fallback is running without PPS.");
+
+            if (!allowFallbackProcessingWithoutPPS)
+            {
+                candidate->failure = sync_fault_t::pps_missing;
+                return false;
+            }
+
+            candidate->pps_release_time_us = esp_timer_get_time();
+        }
+    }
+    else
+    {
+        clear_pps_events();
+        if (xSemaphoreTake(s_pps_semaphore, pdMS_TO_TICKS(1500)) != pdTRUE)
+        {
+            if (debugIsOn)
+                ESP_LOGE(TAG, "UBX mode is running without PPS.");
+
+            candidate->failure = sync_fault_t::pps_missing;
+            if (allowFallbackProcessingWithoutPPS)
+            {
+                if (debugIsOn)
+                    ESP_LOGW(TAG, "Switching to NMEA fallback because PPS is unavailable.");
+                s_use_nmea_fallback = true;
+            }
+            return false;
+        }
+
+        if (!s_gps.getPVT())
+        {
+            candidate->failure = sync_fault_t::gps_invalid;
+            return false;
+        }
+
+        if (!s_gps.getDateValid() || !s_gps.getTimeValid())
+        {
+            candidate->failure = sync_fault_t::gps_invalid;
+            return false;
+        }
+
+        int year = s_gps.getYear();
+        int month = s_gps.getMonth();
+        int day = s_gps.getDay();
+        int hour = s_gps.getHour();
+        int minute = s_gps.getMinute();
+        int second = s_gps.getSecond();
+
+        if (year <= 2022 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60)
+        {
+            candidate->failure = sync_fault_t::gps_invalid;
+            return false;
+        }
+
+        candidate->candidate_time = epoch_from_utc(year, month, day, hour, minute, second) + 1;
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        clear_pps_events();
+        if (xSemaphoreTake(s_pps_semaphore, pdMS_TO_TICKS(1500)) != pdTRUE)
+        {
+            if (debugIsOn)
+                ESP_LOGE(TAG, "UBX mode lost PPS alignment pulse.");
+
+            candidate->failure = sync_fault_t::pps_missing;
+            if (allowFallbackProcessingWithoutPPS)
+            {
+                if (debugIsOn)
+                    ESP_LOGW(TAG, "Switching to NMEA fallback because PPS is unavailable.");
+                s_use_nmea_fallback = true;
+            }
+            return false;
+        }
+
+        candidate->pps_release_time_us = esp_timer_get_time();
+        candidate->use_pps_alignment = true;
+    }
+
+    if ((esp_timer_get_time() - attempt_start_us) > Max_Sync_Attempt_Us)
+    {
+        candidate->failure = sync_fault_t::gps_invalid;
+        return false;
+    }
+
+    candidate->used_nmea_fallback = s_use_nmea_fallback;
+    return true;
+}
+
+static void handle_runtime_sync_failure(sync_fault_t fault, time_t update_delta, uint32_t retry_delay_ms)
+{
+    uint32_t failure_count = sync_state_note_failure(fault, update_delta);
+    sync_state_t snapshot = get_sync_state_snapshot();
+
+    s_time_setting_in_progress.store(false);
+
+    if (failure_count >= Sync_Failures_Before_Runtime_Recovery && (failure_count % Sync_Failures_Before_Runtime_Recovery) == 0)
+    {
+        if (debugIsOn)
+            ESP_LOGW(TAG, "Runtime GPS recovery attempt after %lu consecutive sync failures.", static_cast<unsigned long>(failure_count));
+        setup_gps();
+        sync_state_reset_failure_counters();
+    }
+
+    if (snapshot.last_successful_sync_us > 0 && (esp_timer_get_time() - snapshot.last_successful_sync_us) > Sync_Reboot_After_Us)
+    {
+        if (debugIsOn)
+            ESP_LOGE(TAG, "Rebooting after extended holdover without a successful GPS resync.");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+}
+
 static void gps_time_sync_task(void *parameter)
 {
     bool first_sync = true;
@@ -2123,164 +2485,80 @@ static void gps_time_sync_task(void *parameter)
 
         */
 
-        s_time_setting_in_progress = true;
+        s_time_setting_in_progress.store(true);
+        sync_state_note_attempt();
 
-        time_t candidate_time = 0;
-        bool use_pps_alignment = false;
-        int64_t pps_release_time_us = esp_timer_get_time();
-
-        if (s_use_nmea_fallback)
+        sync_candidate_t candidate{};
+        if (!acquire_sync_candidate(&candidate))
         {
-            nmea_rmc_time_t nmea_time{};
-            if (!wait_for_nmea_rmc_time(&nmea_time, 3000UL))
-            {
-                s_time_setting_in_progress = false;
-                vTaskDelay(pdMS_TO_TICKS(200));
-                continue;
-            }
-
-            candidate_time = epoch_from_utc(nmea_time.year, nmea_time.month, nmea_time.day, nmea_time.hour, nmea_time.minute, nmea_time.second);
-
-            clear_pps_events();
-            if (xSemaphoreTake(s_pps_semaphore, pdMS_TO_TICKS(1500)) == pdTRUE)
-            {
-                use_pps_alignment = true;
-                pps_release_time_us = esp_timer_get_time();
-                candidate_time += 1;
-            }
-            else
-            {
-                ESP_LOGE(TAG, "NMEA fallback is running without PPS.");
-                display_line(2, "NMEA fallback no PPS");
-
-                if (!allowFallbackProcessingWithoutPPS)
-                {
-                    ESP_LOGE(TAG, "Fallback without PPS is not allowed - check the ESP32TimeServerSetting.h file.");
-                    display_line(2, "GPS PPS unavailable");
-                    s_time_setting_in_progress = false;
-                    while (true)
-                        vTaskDelay(pdMS_TO_TICKS(1000));
-                }
-
-                pps_release_time_us = esp_timer_get_time();
-            }
-        }
-        else
-        {
-            clear_pps_events();
-            if (xSemaphoreTake(s_pps_semaphore, pdMS_TO_TICKS(1500)) != pdTRUE)
-            {
-                ESP_LOGE(TAG, "UBX mode is running without PPS.");
-                display_line(2, "UBX mode no PPS");
-
-                if (!allowFallbackProcessingWithoutPPS)
-                {
-                    ESP_LOGE(TAG, "Fallback without PPS is not allowed - check the ESP32TimeServerSetting.h file.");
-                    display_line(2, "Fallback not allowed");
-                    s_time_setting_in_progress = false;
-                    while (true)
-                        vTaskDelay(pdMS_TO_TICKS(1000));
-                }
-
-                ESP_LOGW(TAG, "Switching to NMEA fallback because PPS is unavailable.");
-                s_use_nmea_fallback = true;
-                s_time_setting_in_progress = false;
-                continue;
-            }
-
-            if (!s_gps.getPVT())
-            {
-                s_time_setting_in_progress = false;
-                continue;
-            }
-
-            if (!s_gps.getDateValid() || !s_gps.getTimeValid())
-            {
-                s_time_setting_in_progress = false;
-                continue;
-            }
-
-            int year = s_gps.getYear();
-            int month = s_gps.getMonth();
-            int day = s_gps.getDay();
-            int hour = s_gps.getHour();
-            int minute = s_gps.getMinute();
-            int second = s_gps.getSecond();
-
-            if (year <= 2022 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60)
-            {
-                s_time_setting_in_progress = false;
-                continue;
-            }
-
-            candidate_time = epoch_from_utc(year, month, day, hour, minute, second) + 1;
-
-            vTaskDelay(pdMS_TO_TICKS(200));
-
-            clear_pps_events();
-            if (xSemaphoreTake(s_pps_semaphore, pdMS_TO_TICKS(1500)) != pdTRUE)
-            {
-                ESP_LOGE(TAG, "UBX mode lost PPS alignment pulse.");
-                display_line(2, "UBX mode no PPS");
-
-                if (!allowFallbackProcessingWithoutPPS)
-                {
-                    ESP_LOGE(TAG, "Fallback without PPS is not allowed - check the ESP32TimeServerSetting.h file.");
-                    display_line(2, "Fallback not allowed");
-                    s_time_setting_in_progress = false;
-                    while (true)
-                        vTaskDelay(pdMS_TO_TICKS(1000));
-                }
-
-                ESP_LOGW(TAG, "Switching to NMEA fallback because PPS is unavailable.");
-                s_use_nmea_fallback = true;
-                s_time_setting_in_progress = false;
-                continue;
-            }
-
-            pps_release_time_us = esp_timer_get_time();
-            use_pps_alignment = true;
+            handle_runtime_sync_failure(candidate.failure, 0, 1000);
+            continue;
         }
 
-        bool sanity_check_passed = first_sync;
+        if (first_sync)
+        {
+            sync_candidate_t confirmation_candidate{};
+            if (!acquire_sync_candidate(&confirmation_candidate))
+            {
+                handle_runtime_sync_failure(confirmation_candidate.failure, 0, 1000);
+                continue;
+            }
+
+            if (!first_sync_candidates_are_plausible(candidate, confirmation_candidate))
+            {
+                handle_runtime_sync_failure(sync_fault_t::gps_invalid, 0, 1000);
+                continue;
+            }
+
+            candidate = confirmation_candidate;
+        }
+
         time_t update_delta = 0;
         if (!first_sync)
         {
             time_t current_time = time(nullptr);
-            update_delta = current_time - candidate_time;
-            sanity_check_passed = (update_delta >= -safeguardThresholdInSeconds) && (update_delta <= safeguardThresholdInSeconds);
-        }
-
-        if (!sanity_check_passed)
-        {
-            s_safe_guard_tripped = true;
-            s_time_setting_in_progress = false;
-
-            if (debugIsOn)
-                ESP_LOGE(TAG, "Sanity check failed.");
-
-            if (rebootIfSanityCheckFails)
+            update_delta = current_time - candidate.candidate_time;
+            bool sanity_check_passed = (update_delta >= -safeguardThresholdInSeconds) && (update_delta <= safeguardThresholdInSeconds);
+            if (!sanity_check_passed)
             {
+                uint32_t sanity_failure_count = sync_state_note_sanity_retry(update_delta);
+                s_time_setting_in_progress.store(false);
+
                 if (debugIsOn)
-                    ESP_LOGE(TAG, "Restarting according to settings.");
-                vTaskDelay(pdMS_TO_TICKS(200));
-                esp_restart();
-            }
-            else
-            {
+                    ESP_LOGE(TAG, "Sanity check failed with delta %lld on attempt %lu.", static_cast<long long>(update_delta), static_cast<unsigned long>(sanity_failure_count));
+
+                if (sanity_failure_count < Sanity_Failures_Before_Fault)
+                {
+                    vTaskDelay(pdMS_TO_TICKS(250));
+                    continue;
+                }
+
+                s_safe_guard_tripped.store(true);
+                sync_state_note_failure(sync_fault_t::sanity_mismatch, update_delta);
+
+                if (rebootIfSanityCheckFails)
+                {
+                    if (debugIsOn)
+                        ESP_LOGE(TAG, "Restarting according to settings.");
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    esp_restart();
+                }
+
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
-            };
+            }
         }
+
+        sync_state_clear_sanity_failures();
 
         if (xSemaphoreTake(s_time_mutex, portMAX_DELAY) == pdTRUE)
         {
-            int64_t elapsed_us = use_pps_alignment ? (esp_timer_get_time() - pps_release_time_us) : 0;
+            int64_t elapsed_us = candidate.use_pps_alignment ? (esp_timer_get_time() - candidate.pps_release_time_us) : 0;
             if (elapsed_us < 0)
                 elapsed_us = 0;
 
             struct timeval tv{};
-            tv.tv_sec = candidate_time + static_cast<time_t>(elapsed_us / 1000000LL);
+            tv.tv_sec = candidate.candidate_time + static_cast<time_t>(elapsed_us / 1000000LL);
             tv.tv_usec = static_cast<suseconds_t>(elapsed_us % 1000000LL);
             settimeofday(&tv, nullptr);
             s_ntp_reference_time_64 = get_current_time_in_ntp64_format();
@@ -2288,10 +2566,11 @@ static void gps_time_sync_task(void *parameter)
 
             xSemaphoreGive(s_time_mutex);
 
-            s_safe_guard_tripped = false;
-            s_time_setting_in_progress = false;
-            s_time_has_been_set = true;
+            s_safe_guard_tripped.store(false);
+            s_time_setting_in_progress.store(false);
+            s_time_has_been_set.store(true);
             first_sync = false;
+            sync_state_note_success(update_delta);
 
             if (s_attempt_no_signal_recovery)
             {
@@ -2308,8 +2587,8 @@ static void gps_time_sync_task(void *parameter)
                 time_t now_utc = time(nullptr);
                 format_local_date_time(now_utc, date_string, sizeof(date_string), time_string, sizeof(time_string));
 
-                if (s_use_nmea_fallback)
-                    ESP_LOGI(TAG, "GPS time sync ( using NMEA fallback %s ) on %s at %s", use_pps_alignment ? "with PPS alignment" : "without PPS alignment", date_string, time_string);
+                if (candidate.used_nmea_fallback)
+                    ESP_LOGI(TAG, "GPS time sync ( using NMEA fallback %s ) on %s at %s", candidate.use_pps_alignment ? "with PPS alignment" : "without PPS alignment", date_string, time_string);
                 else
                     ESP_LOGI(TAG, "GPS time sync on %s at %s", date_string, time_string);
             };
@@ -2336,7 +2615,7 @@ void setup_the_gps()
     xTaskCreatePinnedToCore(gps_time_sync_task, "gps_time_sync", 2540, nullptr, 15, nullptr, tskNO_AFFINITY);
     xTaskCreatePinnedToCore(pps_discipline_task, "pps_discipline", 2385, nullptr, 14, nullptr, tskNO_AFFINITY);
 
-    while (!s_time_has_been_set)
+    while (!s_time_has_been_set.load())
         vTaskDelay(pdMS_TO_TICKS(100));
 }
 
@@ -2498,16 +2777,19 @@ static void update_display_task(void *parameter)
             if (check_uptime_request())
                 display_uptime_seconds_counter = upTimeDisplayWillStayActiveForThisManySeconds;
 
+            sync_state_t sync_snapshot = get_sync_state_snapshot();
+            bool sync_fault_active = s_safe_guard_tripped.load() || sync_snapshot.holdover_mode;
+
             int required_top_line_message = 1;
             if (display_uptime_seconds_counter > 0)
             {
                 required_top_line_message = 4;
             }
-            else if (s_safe_guard_tripped)
+            else if (sync_fault_active)
             {
                 required_top_line_message = 3;
             }
-            else if (s_time_setting_in_progress)
+            else if (s_time_setting_in_progress.load())
             {
                 required_top_line_message = 2;
             }
@@ -2562,7 +2844,7 @@ static void update_display_task(void *parameter)
                 format_local_date_time(now_utc, date_line, sizeof(date_line), time_line, sizeof(time_line));
                 display_line(1, date_line);
                 display_line(2, time_line);
-                display_line(3, s_ip_address);
+                display_line(3, sync_fault_active ? sync_fault_to_display_text(sync_snapshot.fault) : s_ip_address);
             }
         }
 
