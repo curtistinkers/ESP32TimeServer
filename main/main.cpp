@@ -1,4 +1,4 @@
-// ESP32 Time Server v2.1
+// ESP32 Time Server v2.2
 // Copyright Rob Latour, 2026
 
 //
@@ -54,6 +54,7 @@ extern "C"
 {
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -578,6 +579,32 @@ static bool initialize_nvs_storage()
 
     return true;
 }
+
+static bool parse_mac_id_string(const char *text, uint8_t mac[6])
+{
+    if (text == nullptr || mac == nullptr || text[0] == '\0' || std::strlen(text) != 17)
+        return false;
+
+    if (text[2] != ':' || text[5] != ':' || text[8] != ':' || text[11] != ':' || text[14] != ':')
+        return false;
+
+    unsigned int values[6] = {};
+    if (std::sscanf(text,
+                    "%2x:%2x:%2x:%2x:%2x:%2x",
+                    &values[0],
+                    &values[1],
+                    &values[2],
+                    &values[3],
+                    &values[4],
+                    &values[5]) != 6)
+        return false;
+
+    for (size_t index = 0; index < 6; ++index)
+        mac[index] = static_cast<uint8_t>(values[index]);
+
+    return true;
+}
+
 
 static uint32_t get_highest_candidate_gps_baud()
 {
@@ -1858,7 +1885,9 @@ void write_opening_messages_to_the_console()
     Serial.begin(serialMonitorSpeed);
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "******************* Application Startup *******************");
+    ESP_LOGI(TAG, "ESP32 Time Sever v2.2");
 
     if (!debugIsOn)
     {
@@ -1936,8 +1965,33 @@ static void setup_up_time_button()
     }
 }
 
+static void configure_mac_address()
+{
+    if (MACAddress[0] == '\0')
+        return;
+
+    uint8_t mac[6] = {};
+    if (!parse_mac_id_string(MACAddress, mac))
+    {      
+        ESP_LOGE(TAG, "Configured MAC address is invalid: %s", MACAddress);
+        return;
+    }
+
+    esp_err_t err = esp_base_mac_addr_set(mac);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to set MAC address to %s: %s", MACAddress, esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Configured MACAddress applied: " MACSTR, MAC2STR(mac));
+}
+
 void setup_ethernet_connection()
 {
+
+    configure_mac_address();
+
     display_line(1, "Connecting Ethernet");
     display_line(2, "");
     setup_ethernet();
@@ -2905,7 +2959,7 @@ extern "C" void app_main()
     initArduino();
 
     write_opening_messages_to_the_console();
-
+    
     setup_NVM_storage();
 
     create_mutexes_and_semaphores();

@@ -1,4 +1,4 @@
-# ESP32 NTP Stratum 1 Time Server (version 2.1)
+# ESP32 NTP Stratum 1 Time Server (version 2.2)
 
 **ESP32 NTP Stratum 1 Time Server for your home network**
 
@@ -31,6 +31,7 @@ Version 2 is a significant upgrade over [Version 1](https://github.com/roblatour
 - **Built with ESP-IDF** — rewritten from the ground up in C++ on ESP-IDF v5.5.3 using FreeRTOS tasks.
 - **NVS-backed GPS state** — the GPS module identity and baud rate are persisted across reboots so following the initial setup startup speed is quick.
 - **Broader GNSS module support** — still works great with the SparkFun MAX-M10S (recommended), but now also supports lower-cost, generic GNSS modules, even those (although not recommended) that do not expose a PPS pin.
+- **Ability to set a custom MAC Address** — (version 2.2) allows the use of the default ESP32-P4's MAC address or for a custom MAC address to be set.
 
 > The source code for **Version 1** (Arduino / PlatformIO) remains available at:
 > [https://github.com/roblatour/ESP32TimeServer/releases/tag/v1.0.0.0](https://github.com/roblatour/ESP32TimeServer/releases/tag/v1.0.0.0)

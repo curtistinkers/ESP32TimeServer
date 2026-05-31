@@ -27,6 +27,11 @@ static constexpr char DeviceName[] = "ESP32TimeServer";
 static constexpr char OTA_Password[] = "ESP32TimeServerpw";
 static constexpr uint16_t OTA_Port = 3232;
 
+// support for the (optional) setting of the ESP32-P4's MAC address
+// set the value below to "" to use the ESP32-P4's default MAC address, or
+// set the value below to a desired MAC address, such as "80:f1:b2:d1:d9:18"
+static constexpr char MACAddress[] = "";
+
 // GPS support (required)
 static constexpr int TXPin = 16;
 static constexpr int RXPin = 17;
