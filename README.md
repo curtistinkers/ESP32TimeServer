@@ -1,4 +1,4 @@
-# ESP32 NTP Stratum 1 Time Server (version 2.2)
+# ESP32 NTP Stratum 1 Time Server (version 2.2.1)
 
 **ESP32 NTP Stratum 1 Time Server for your home network**
 
@@ -111,9 +111,10 @@ This release is built using:
 
 ### Dependencies
 
-Dependencies are managed automatically via the ESP-IDF Component Manager:
+The [`SparkFun u-blox GNSS Arduino Library v3`](https://github.com/sparkfun/SparkFun_u-blox_GNSS_v3) (v3.1.13) is **bundled** directly in the [`components/SparkFun_u-blox_GNSS_v3`](./components/SparkFun_u-blox_GNSS_v3) directory. Since it is an Arduino library and is not published to the ESP-IDF Component Registry, it is included as source so that a fresh clone of this repository builds without any manual download step.
 
-- [`SparkFun u-blox GNSS Arduino Library v3`](https://github.com/sparkfun/SparkFun_u-blox_GNSS_v3) — GPS communication
+The remaining dependencies are managed automatically via the ESP-IDF Component Manager (declared in [`main/idf_component.yml`](./main/idf_component.yml)):
+
 - `esp-idf-lib/hd44780` — LCD driver
 - `esp-idf-lib/pcf8574` — I²C LCD backpack driver
 - `espressif/arduino-esp32` — Arduino compatibility layer (used for OTA and serial)

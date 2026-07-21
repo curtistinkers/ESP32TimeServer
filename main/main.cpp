@@ -1,4 +1,4 @@
-// ESP32 Time Server v2.2
+// ESP32 Time Server v2.2.1
 // Copyright Rob Latour, 2026
 
 //
@@ -1887,7 +1887,7 @@ void write_opening_messages_to_the_console()
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "******************* Application Startup *******************");
-    ESP_LOGI(TAG, "ESP32 Time Sever v2.2");
+    ESP_LOGI(TAG, "ESP32 Time Sever v2.2.1");
 
     if (!debugIsOn)
     {
