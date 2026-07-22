@@ -1,0 +1,33 @@
+name: Build ESP32TimeServer (ESP-IDF v6.0.2)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-v602:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository From Scratch
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+
+    - name: Clean Compile with ESP-IDF v6.0.2
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v6.0.2
+        target: esp32p4
+        command: |
+          idf.py fullclean
+          idf.py build
+
+    - name: Upload Binary Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ESP32TimeServer-v6.0.2-Binary
+        path: build\ESP32TimeServer.bin
