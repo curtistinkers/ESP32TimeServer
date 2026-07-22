@@ -2,6 +2,8 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
+add_compile_definitions(CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6")
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(ESP32TimeServer
         VERSION 2.2.1
