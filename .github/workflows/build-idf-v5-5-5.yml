@@ -17,14 +17,24 @@ jobs:
       with:
         submodules: 'recursive'
 
+    - name: Setup Compiler Cache (ccache)
+      uses: actions/cache@v4
+      with:
+        path: .ccache
+        key: esp32p4-v5.5.5-ccache-${{ github.run_id }}
+        restore-keys: |
+          esp32p4-v5.5.5-ccache-
+
     - name: Clean Compile with ESP-IDF v5.5.5
       uses: espressif/esp-idf-ci-action@v1
+      env:
+        # Maps the runner folder to the workspace to make caching tracking persistent
+        CCACHE_DIR: ${{ github.workspace }}/.ccache
       with:
         esp_idf_version: v5.5.5
         target: esp32p4
         command: |
-          idf.py fullclean
-          idf.py build
+          idf.py --ccache build
 
     - name: Upload Binary Artifact
       uses: actions/upload-artifact@v4
