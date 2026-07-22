@@ -36,8 +36,8 @@ jobs:
         command: |
           idf.py --ccache build
 
-    - name: Upload Binary Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ESP32TimeServer-v5.5.5-Binary
-        path: build/ESP32TimeServer.bin
+    # - name: Upload Binary Artifact
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: ESP32TimeServer_ESP-IDF-v5.5.5.bin
+    #     path: build/ESP32TimeServer.bin
