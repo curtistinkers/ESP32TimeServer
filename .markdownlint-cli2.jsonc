@@ -1,0 +1,7 @@
+{
+  "config": {
+    "default": true,
+    "MD033": { "allowed_elements": ["sup", "img"] }
+  },
+  "gitignore": true
+}
