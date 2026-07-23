@@ -2,9 +2,9 @@ name: Build ESP32TimeServer (ESP-IDF v6.0.2)
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
