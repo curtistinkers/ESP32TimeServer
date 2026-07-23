@@ -70,7 +70,7 @@ default ESP32-P4's MAC address or for a custom MAC address to be set.
 | 1   | *(Optional)* USB C extension cable (with right angle end) ([AliExpress](https://www.aliexpress.com/item/1005006584965187.html)) <sup>1</sup> + two M3*8 |
 | —   | Miscellaneous: Ethernet cable, female dupont connection wires, small 4" .1" zip ties, solder <sup>2</sup> |
 | —   | A PoE-capable switch, PoE injector, **or** USB-C power supply and USB-C cable |
-<!-- markdownlint-disable line-length table-column-style -->
+<!-- markdownlint-enable line-length table-column-style -->
 
 > ⚠️ **WARNING — Do NOT power the ESP32-P4-ETH via both its USB-C connector and
 a PoE powered Ethernet cable at the same time.**

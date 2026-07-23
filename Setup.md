@@ -11,7 +11,9 @@ Before pointing any client at the ESP32 Time Server, it should have a **fixed, r
 The easiest way to do this is through a **DHCP reservation** (sometimes called a static DHCP binding) on your router or firewall, keyed on the ESP32's MAC address.
 
 > **Finding the IP address**
+>
 > Once the ESP32 Time Server boots and connects to the network:
+>
 > - If an **LCD screen is connected**, the assigned IP address is displayed on the screen.
 > - If **no LCD is configured**, the IP address is printed to the serial console log (visible via `idf.py monitor` or any serial terminal at 115200 baud).
 
@@ -88,7 +90,7 @@ After installation, edit the NTP configuration file to point to the ESP32 Time S
 2. Open the file `C:\Program Files (x86)\NTP\etc\ntp.conf` (or `C:\Program Files\NTP\etc\ntp.conf` depending on your system).
 3. Find any existing `server` or `pool` lines and replace them with the IP address of your ESP32 Time Server. For example:
 
-   ```
+   ```plaintext
    server 192.168.1.50 iburst prefer
    ```
 
@@ -169,7 +171,7 @@ Most Linux distributions use either `systemd-timesyncd` (simple, default on many
 
 3. Comment out or remove existing `pool` / `server` lines and add:
 
-   ```
+   ```bash
    server 192.168.1.50 iburst prefer
    ```
 
@@ -208,7 +210,7 @@ Most Linux distributions use either `systemd-timesyncd` (simple, default on many
 
 3. Replace existing `pool` / `server` lines with:
 
-   ```
+   ```bash
    server 192.168.1.50 iburst prefer
    ```
 
@@ -240,7 +242,7 @@ macOS uses its own NTP client, configurable via the **Date & Time** system setti
 4. Ensure **Set date and time automatically** is enabled.
 5. In the NTP server field, replace the existing value (e.g., `time.apple.com`) with the IP address of the ESP32 Time Server, for example:
 
-   ```
+   ```plaintext
    192.168.1.50
    ```
 
