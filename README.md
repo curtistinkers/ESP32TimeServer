@@ -131,6 +131,18 @@ Edit this file before building to match your hardware setup.
 
 ### Build & Flash
 
+Pull the git repository with submodule:
+
+```cmd
+git clone --recursive https://github.com/roblatour/ESP32TimeServer
+```
+
+Or, pull the submodule if you've already cloned the repository:
+
+```cmd
+git submodule update --init --recursive
+```
+
 Load the ESP-IDF environment, then build and flash:
 
 ```cmd
