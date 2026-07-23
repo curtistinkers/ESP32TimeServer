@@ -3,5 +3,10 @@
     "default": true,
     "MD033": { "allowed_elements": ["sup", "img"] }
   },
-  "gitignore": true
+  "ignores": [
+    "build/**",
+    "managed_components/**",
+    "components/**",
+    "3rdparty/**"
+  ]
 }
