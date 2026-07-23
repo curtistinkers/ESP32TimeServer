@@ -141,6 +141,8 @@ This release is built using:
 - **[Espressif ESP-IDF Extension for VS Code](https://marketplace.visualstudio.com/items?itemName=espressif.esp-idf-extension)**
 - **ESP-IDF v5.5.3**
 
+(It has been tested to compile on 5.5.3+ and 6.0.2+)
+
 ### Dependencies
 
 The [`SparkFun u-blox GNSS Arduino Library v3`](https://github.com/sparkfun/SparkFun_u-blox_GNSS_v3)
